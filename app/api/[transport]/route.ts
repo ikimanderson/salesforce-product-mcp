@@ -1,5 +1,4 @@
 import { createMcpHandler } from "mcp-handler";
-import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { SalesforceError } from "@/lib/salesforce";
 import {
@@ -8,6 +7,15 @@ import {
   updateProduct2,
   type FieldValue,
 } from "@/lib/product2";
+import {
+  validateBulkSampleRows,
+  createBulkJob,
+  getBulkJobStatus,
+  getBulkJobFailedResultsSummary,
+  MAX_ROW_COUNT,
+  type BulkOperation,
+} from "@/lib/bulkProduct2";
+import { isAuthorized, unauthorizedResponse } from "@/lib/auth";
 
 // MCP routes must run on the Node.js runtime (not Edge): they use node:crypto
 // and the Salesforce client.
@@ -47,10 +55,16 @@ function toErrorResult(err: unknown): ToolResult {
 // ---------------------------------------------------------------------------
 // MCP server definition.
 //
-// This server is deliberately narrow: it only ever writes to Product2, and
-// only via these two tools. It does not expose SOQL or any other sobject —
-// that's the read-only sibling server's job. Keeping this one single-purpose
-// keeps its blast radius (and its bearer token's blast radius) small.
+// This server is deliberately narrow: it only ever writes to Product2. It
+// does not expose SOQL or any other sobject — that's the read-only sibling
+// server's job. Keeping this one single-purpose keeps its blast radius (and
+// its bearer token's blast radius) small.
+//
+// Four tools: create_product2/update_product2 write one record per call.
+// start_bulk_product2_job/get_bulk_product2_job_status handle multi-row CSV
+// imports via Salesforce's Bulk API 2.0 — the actual CSV bytes never pass
+// through a tool call (see start_bulk_product2_job's doc string and
+// app/api/bulk/[jobId]/data/route.ts); only small metadata does.
 // ---------------------------------------------------------------------------
 
 const handler = createMcpHandler(
@@ -161,6 +175,138 @@ const handler = createMcpHandler(
         }
       },
     );
+
+    // ----- start_bulk_product2_job ---------------------------------------------
+    // Opens a Salesforce Bulk API 2.0 job for a multi-row CSV import (insert/
+    // update/upsert). This tool NEVER carries the actual row data beyond a
+    // small validation sample -- a real CSV (the kind previously run through
+    // dataloader.io, up to several thousand rows) is far too much to embed in
+    // a tool call. Guarded the same way as the single-record tools: without
+    // confirm: true, this only validates rowCount + sampleRows and returns a
+    // preview, with no Salesforce call made. confirm: true actually opens the
+    // job and returns an uploadPath -- a RELATIVE path (there's no reliable
+    // way to learn this deployment's own base URL from inside an MCP tool
+    // handler), meant to be PUT to via curl from a shell-capable session, not
+    // embedded in another tool call. See app/api/bulk/[jobId]/data/route.ts
+    // for the upload contract (including chunking for larger files).
+    server.tool(
+      "start_bulk_product2_job",
+      "Open a Salesforce Bulk API 2.0 job to insert, update, or upsert many " +
+        "Product2 records from a CSV file. Without confirm: true, validates " +
+        "rowCount and sampleRows and returns a preview, with no Salesforce call " +
+        "made. Pass confirm: true to actually open the job, which returns an " +
+        "uploadPath -- PUT your CSV file to that path (relative to this " +
+        "server's host) via curl, NOT through another tool call; the CSV never " +
+        "passes through this tool. For upsert, externalIdFieldName must be a " +
+        "field already marked as an External ID in Salesforce Object Manager.",
+      {
+        operation: z
+          .enum(["insert", "update", "upsert"])
+          .describe('"insert" for new records, "update" by Id, or "upsert" matched by externalIdFieldName.'),
+        externalIdFieldName: z
+          .string()
+          .optional()
+          .describe('Required for "upsert" only -- the External ID field to match existing records on.'),
+        rowCount: z
+          .number()
+          .int()
+          .positive()
+          .describe("Total number of data rows in the CSV file you intend to upload (not counting the header)."),
+        sampleRows: z
+          .array(z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])))
+          .min(1)
+          .max(10)
+          .describe(
+            "A SMALL sample (1-10 rows) of the real data, used only to validate column names before " +
+              "opening a job -- not the full file. For \"update\", each row must include \"Id\". For " +
+              '"upsert", each row must include the externalIdFieldName column. No "attributes" or ' +
+              "relationship fields (e.g. \"Owner.Name\").",
+          ),
+        confirm: z
+          .boolean()
+          .optional()
+          .describe(
+            "Set to true to actually open the Bulk API job. Omit or set false to validate and preview only.",
+          ),
+      },
+      async ({ operation, externalIdFieldName, rowCount, sampleRows, confirm }): Promise<ToolResult> => {
+        try {
+          if (rowCount > MAX_ROW_COUNT) {
+            return fail(
+              `rowCount (${rowCount}) exceeds the ${MAX_ROW_COUNT}-row sanity cap for this tool. ` +
+                "This is a mistake-guard against pointing at the wrong file, not a Salesforce limit -- " +
+                "if you genuinely need to import more rows than that, split the file.",
+            );
+          }
+          if (operation === "upsert" && !externalIdFieldName?.trim()) {
+            return fail('externalIdFieldName is required when operation is "upsert".');
+          }
+
+          const validation = validateBulkSampleRows(
+            operation as BulkOperation,
+            sampleRows as Array<Record<string, FieldValue>>,
+            { externalIdFieldName },
+          );
+          if (!validation.ok) return fail(validation.error);
+
+          if (!confirm) {
+            return ok({
+              dryRun: true,
+              operation,
+              externalIdFieldName,
+              rowCount,
+              sampleRowsValidated: sampleRows.length,
+              note: "No job created. Call again with confirm: true to open the Bulk API job.",
+            });
+          }
+
+          const job = await createBulkJob(operation as BulkOperation, externalIdFieldName);
+          return ok({
+            dryRun: false,
+            jobId: job.id,
+            state: job.state,
+            uploadPath: `/api/bulk/${job.id}/data`,
+            note:
+              "PUT your CSV to this path on the SAME HOST you called this MCP endpoint on, via curl " +
+              "(e.g. curl --data-binary @file.csv -H \"Authorization: Bearer <MCP_BEARER_TOKEN>\" -X PUT " +
+              "\"<host>/api/bulk/" +
+              job.id +
+              "/data\"), not through another tool call. If the file might exceed a few MB, split it into " +
+              "row-aligned chunks: PUT each non-final chunk with ?final=false, and only the LAST chunk " +
+              "with ?final=true (or omit the param on a single-shot upload). Only the FIRST chunk may " +
+              "include the CSV header row. After uploading, poll get_bulk_product2_job_status.",
+          });
+        } catch (err) {
+          return toErrorResult(err);
+        }
+      },
+    );
+
+    // ----- get_bulk_product2_job_status -----------------------------------------
+    // Read-only status check for a job opened by start_bulk_product2_job. Once
+    // the job has finished (JobComplete or Failed), also fetches a CAPPED
+    // summary of failed rows -- never the full result set, however many
+    // thousand rows actually failed.
+    server.tool(
+      "get_bulk_product2_job_status",
+      "Check the status of a Bulk API 2.0 job started by start_bulk_product2_job. " +
+        "Once the job has finished, also returns a capped summary of any failed rows.",
+      {
+        jobId: z.string().describe("The job Id returned by start_bulk_product2_job."),
+      },
+      async ({ jobId }): Promise<ToolResult> => {
+        try {
+          const status = await getBulkJobStatus(jobId);
+          if (status.state !== "JobComplete" && status.state !== "Failed") {
+            return ok(status);
+          }
+          const failedResults = await getBulkJobFailedResultsSummary(jobId);
+          return ok({ ...status, failedResults });
+        } catch (err) {
+          return toErrorResult(err);
+        }
+      },
+    );
   },
   {
     // Server metadata surfaced to MCP clients / the Inspector.
@@ -179,19 +325,17 @@ const handler = createMcpHandler(
 
 // ---------------------------------------------------------------------------
 // Auth layer 1: Claude → this server. A shared secret guards the public URL
-// that can write CRM data.
+// that can write CRM data. Token extraction/comparison lives in lib/auth.ts
+// (shared with the bulk-upload route in app/api/bulk/[jobId]/data/route.ts).
 //
 // We deliberately do NOT use mcp-handler's withMcpAuth here: it advertises
 // OAuth "protected resource" metadata on a 401, which makes the claude.ai
 // custom-connector UI attempt a full OAuth sign-in flow against a server that
 // has no OAuth authorization server (the connector dialog has no bearer-token
-// field). Instead we accept the shared secret two ways and return a PLAIN 401
-// (no WWW-Authenticate/resource_metadata) so no client tries to negotiate
-// OAuth:
-//   1. `Authorization: Bearer <token>` header — for curl, Claude Code, and the
-//      Claude API MCP connector (authorization_token).
-//   2. a `?token=<token>` (or `?key=`) query param — for the claude.ai custom
-//      connector, where the secret is baked into the connector URL.
+// field). Instead lib/auth.ts's isAuthorized() accepts the shared secret two
+// ways (Authorization header or ?token=/?key= query param) and this route
+// returns a PLAIN 401 (no WWW-Authenticate/resource_metadata) so no client
+// tries to negotiate OAuth.
 //
 // This bearer token should be treated as MORE sensitive than the read-only
 // sibling server's token: anyone holding it can create/update Product2
@@ -199,41 +343,9 @@ const handler = createMcpHandler(
 // be rotated/revoked independently.
 // ---------------------------------------------------------------------------
 
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
-}
-
-function extractToken(req: Request): string | undefined {
-  const authHeader = req.headers.get("authorization");
-  if (authHeader) {
-    const [type, token] = authHeader.split(" ");
-    if (type?.toLowerCase() === "bearer" && token) return token;
-  }
-  const url = new URL(req.url);
-  return url.searchParams.get("token") ?? url.searchParams.get("key") ?? undefined;
-}
-
-function isAuthorized(req: Request): boolean {
-  const expected = process.env.MCP_BEARER_TOKEN;
-  if (!expected) {
-    // Misconfiguration: with no configured secret we cannot authenticate
-    // anyone, so reject all requests rather than fail open.
-    console.error("MCP_BEARER_TOKEN is not set; rejecting all MCP requests.");
-    return false;
-  }
-  const provided = extractToken(req);
-  return provided != null && safeEqual(provided, expected);
-}
-
 async function guarded(req: Request): Promise<Response> {
   if (!isAuthorized(req)) {
-    return new Response(
-      JSON.stringify({ error: "unauthorized", error_description: "Missing or invalid token." }),
-      { status: 401, headers: { "Content-Type": "application/json" } },
-    );
+    return unauthorizedResponse();
   }
   return handler(req);
 }

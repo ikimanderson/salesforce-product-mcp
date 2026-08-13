@@ -170,8 +170,23 @@ function excerpt(text: string, max = 500): string {
  * Authenticated REST call against Salesforce. `path` is relative to the instance
  * URL, e.g. `/services/data/v66.0/sobjects/Product2`. Refreshes the token once
  * on a 401.
+ *
+ * By default the response body is JSON-parsed (or `null` if empty). Pass
+ * `{ rawResponse: true }` for endpoints that return CSV instead of JSON (e.g.
+ * Bulk API's failedResults/successfulResults) — the raw text is returned
+ * as-is, with no parse attempt.
  */
-export async function sfFetch(path: string, init: RequestInit = {}): Promise<unknown> {
+export async function sfFetch(path: string, init?: RequestInit): Promise<unknown>;
+export async function sfFetch(
+  path: string,
+  init: RequestInit,
+  opts: { rawResponse: true },
+): Promise<string>;
+export async function sfFetch(
+  path: string,
+  init: RequestInit = {},
+  opts: { rawResponse?: boolean } = {},
+): Promise<unknown> {
   const doFetch = async (token: CachedToken): Promise<Response> => {
     try {
       return await fetch(`${token.instanceUrl}${path}`, {
@@ -208,6 +223,8 @@ export async function sfFetch(path: string, init: RequestInit = {}): Promise<unk
       excerpt(text),
     );
   }
+
+  if (opts.rawResponse) return text;
 
   if (!text) return null;
   try {

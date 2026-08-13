@@ -9,7 +9,7 @@ apart so the token that can mutate CRM data is distinct from — and smaller in
 blast radius than — the one that only reads it.
 
 - **Endpoint:** `https://salesforce-product-mcp.vercel.app/api/mcp` (Streamable HTTP)
-- **Tools:** `create_product2`, `update_product2`
+- **Tools:** `create_product2`, `update_product2`, `start_bulk_product2_job`, `get_bulk_product2_job_status`
 - **Transport:** Streamable HTTP only (no SSE, no Redis)
 - **Runtime:** Node.js (not Edge)
 
@@ -64,6 +64,73 @@ Updates an existing `Product2` record by Id.
 > OAuth scope list, but **verify this against Salesforce Setup / current
 > Salesforce docs for your org's edition** before relying on it — this is an
 > area that shifts across Salesforce releases.
+
+## Bulk import (Bulk API 2.0)
+
+`create_product2`/`update_product2` write one record per REST call — fine for
+ad-hoc edits, but not for a multi-thousand-row CSV import (the kind
+previously done via dataloader.io). `start_bulk_product2_job` and
+`get_bulk_product2_job_status` add that via Salesforce's
+[Bulk API 2.0](https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/),
+which handles orders of magnitude more data far more efficiently than looping
+single-record calls (and without burning through the Professional Edition API
+add-on's daily quota).
+
+**The actual CSV bytes never pass through an MCP tool call.** A real import
+file (several thousand rows) is roughly 200k+ tokens of raw text — far too
+much to embed in a tool-call argument: slow, expensive, and it risks
+transcription errors as an LLM copies that much data through its own
+context. Instead:
+
+1. Call `start_bulk_product2_job` with `operation` (`insert`/`update`/
+   `upsert`), the total `rowCount`, and a **small sample** (1-10 rows) of the
+   real data for validation. Without `confirm: true`, this only validates
+   the sample and returns a preview — no Salesforce call is made.
+2. With `confirm: true`, it opens a real Bulk API job and returns a relative
+   `uploadPath` (e.g. `/api/bulk/{jobId}/data`).
+3. **From a shell-capable session** (Claude Code or similar — not the
+   Desktop/claude.ai chat connector, which has no way to stream a local file
+   outside the tool-call schema), stream the actual CSV file to that path:
+   ```bash
+   curl --data-binary @file.csv \
+     -H "Authorization: Bearer <MCP_BEARER_TOKEN>" \
+     -X PUT "https://salesforce-product-mcp.vercel.app/api/bulk/<jobId>/data"
+   ```
+   This closes the job and starts Salesforce processing it. The row data
+   never enters the calling model's context — `curl` reads it straight off
+   disk.
+4. Poll `get_bulk_product2_job_status` (an MCP tool call — cheap, small
+   response) until `state` is `JobComplete`. If any rows failed, the result
+   includes a **capped** summary (default: first 25 failures + a total
+   count) — never a full multi-thousand-row result dump.
+
+**Chunking for larger files:** Vercel's Node.js serverless functions have a
+hard ~4.5 MB request-body ceiling (not tunable via Next.js config — that only
+applies to the legacy Pages API). If a file might exceed a few MB, split it
+into row-aligned chunks and `PUT` each non-final chunk with `?final=false`,
+then the last chunk with `?final=true` (or omit the param for a single-shot
+upload). **Only the first chunk may include the CSV header row** — the server
+just relays bytes to Salesforce's batches endpoint, it can't fix a mid-row
+split or a repeated header.
+
+**Row cap:** `start_bulk_product2_job` rejects a declared `rowCount` above
+`MAX_ROW_COUNT` (50,000, in `lib/bulkProduct2.ts`). This is a self-imposed
+mistake-guard against pointing at the wrong file — **not** a Salesforce
+limit; Bulk API 2.0 itself handles far more than that.
+
+**Operation-specific row rules** (validated against the sample you pass to
+`start_bulk_product2_job`, and enforced by Salesforce on the real file):
+- `insert` — rows must NOT include an `Id` column.
+- `update` — every row MUST include an `Id` column (the record to update).
+- `upsert` — every row MUST include the `externalIdFieldName` column, and
+  must NOT include `Id`.
+
+> ⚠️ **Upsert requires Salesforce-side setup that isn't done automatically**:
+> the field you pass as `externalIdFieldName` (e.g. `ProductCode`) must
+> already have the **External ID** checkbox enabled in Salesforce Object
+> Manager → Product2 → Fields & Relationships. It is **not** on by default
+> for standard fields like `ProductCode` — a job created with an
+> unqualified field will fail Salesforce-side.
 
 ## Environment variables
 
@@ -175,6 +242,11 @@ isn't a fit here regardless.
 Once connected, run a dry-run call first (omit `confirm`) to confirm the
 round trip works before doing a real write.
 
+This connector setup covers `create_product2`/`update_product2` fine, but
+**bulk imports (see above) need a shell-capable session**, not this chat
+connector — the `curl`-based upload step has no equivalent in a pure
+chat interface.
+
 ## Operational notes
 
 Professional Edition's API add-on has a modest **daily API call quota**. This
@@ -194,13 +266,21 @@ than re-authenticating each request. Watch usage at:
 app/
   layout.tsx
   page.tsx
-  api/[transport]/route.ts   # MCP handler: bearer auth + create_product2 + update_product2
+  api/
+    [transport]/route.ts    # MCP handler: create_product2, update_product2,
+                             #   start_bulk_product2_job, get_bulk_product2_job_status
+    bulk/[jobId]/data/route.ts  # plain HTTP PUT endpoint for streaming CSV bytes
+                                 #   (not an MCP tool) -- chunked upload contract
 lib/
+  auth.ts                    # shared bearer-token check, used by both routes above
   salesforce.ts              # Client Credentials auth, token cache, REST helper (sfFetch)
-  product2.ts                # Field-name sanitization + create/update calls
+  product2.ts                # Field-name sanitization + single-record create/update
+  bulkProduct2.ts             # Bulk API 2.0 client + row/field validation
 scripts/
   check-auth.mjs             # proves the bearer gate (with/without token)
 tests/
+  auth.test.ts               # bearer-token extraction/comparison unit tests
   salesforce.test.ts         # mocked token + REST call smoke test
   product2.test.ts           # field sanitization + mocked create/update smoke test
+  bulkProduct2.test.ts        # bulk validation rules + mocked Bulk API client calls
 ```

@@ -11,8 +11,8 @@
 
 import { sfFetch, SF_API_VERSION } from "@/lib/salesforce";
 
-const FIELD_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,39}(__c)?$/;
-const DISALLOWED_FIELDS = new Set(["Id", "id", "attributes"]);
+export const FIELD_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,39}(__c)?$/;
+export const DISALLOWED_FIELDS = new Set(["Id", "id", "attributes"]);
 
 export type FieldValue = string | number | boolean | null;
 
