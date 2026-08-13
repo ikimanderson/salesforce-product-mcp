@@ -12,18 +12,22 @@ import { isAuthorized, unauthorizedResponse } from "@/lib/auth";
  * MCP endpoint -- no new secret.
  *
  * PUT /api/bulk/{jobId}/data
- *   Body: raw CSV text (Content-Type doesn't matter to us; we don't parse it here).
- *   Query: ?final=false to upload one batch of a larger, chunked file without
- *     closing the job yet (Vercel's Node.js serverless functions have a hard
- *     ~4.5 MB request-body ceiling that isn't tunable from Next.js config --
- *     that limit only applies to the legacy Pages API, not App Router route
- *     handlers -- so a file that might be a few MB should be split into
- *     row-aligned chunks). Omit the param, or pass final=true, on the last
- *     (or only) chunk to close the job and kick off Salesforce's processing.
+ *   Body: the ENTIRE CSV (header + all data rows), in one request.
  *
- * Only the FIRST chunk may include the CSV header row; every later chunk must
- * be pure data rows, and splits must land on row boundaries -- this route
- * just relays bytes to Salesforce, it can't validate or fix a mid-row split.
+ * IMPORTANT, learned the hard way against a real org: Salesforce's Bulk API
+ * 2.0 ingest jobs accept exactly ONE `PUT .../batches` call per job -- a
+ * second PUT to the same job is rejected outright ("Found multiple contents
+ * for job"). There is no way to append data in multiple calls to one job.
+ * An earlier version of this route supported a `?final=false` chunking
+ * scheme; that was based on a wrong assumption about the API and has been
+ * removed. The real, unavoidable ceiling is Vercel's Node.js serverless
+ * request-body limit (~4.5 MB, not tunable from Next.js config -- that
+ * config only applies to the legacy Pages API, not App Router route
+ * handlers), so the whole CSV must fit under roughly 4.4 MB in one request.
+ * A file that large would need to be split across multiple separate Bulk
+ * API jobs (each with its own single PUT) -- not built here, since it
+ * wasn't needed for the files this server was built for (a few thousand
+ * rows, well under that ceiling).
  */
 
 export const runtime = "nodejs";
@@ -45,28 +49,21 @@ async function handlePut(
     );
   }
 
-  const url = new URL(req.url);
-  const isFinal = url.searchParams.get("final") !== "false";
-
-  const csvChunk = await req.text();
-  if (!csvChunk) {
+  const csv = await req.text();
+  if (!csv) {
     return Response.json(
-      { error: "bad_request", error_description: "Empty request body -- expected raw CSV data." },
+      { error: "bad_request", error_description: "Empty request body -- expected the full raw CSV." },
       { status: 400 },
     );
   }
 
   try {
-    await uploadBulkJobBatch(jobId, csvChunk);
-    if (isFinal) {
-      await closeBulkJob(jobId);
-    }
+    await uploadBulkJobBatch(jobId, csv);
+    await closeBulkJob(jobId);
     return Response.json({
       jobId,
-      closed: isFinal,
-      note: isFinal
-        ? "Upload complete; job closed and Salesforce has started processing. Poll get_bulk_product2_job_status for results."
-        : "Chunk uploaded; job still open. PUT the next chunk to this same URL, and pass final=true (or omit it) on the last one.",
+      closed: true,
+      note: "Upload complete; job closed and Salesforce has started processing. Poll get_bulk_product2_job_status for results.",
     });
   } catch (err) {
     if (err instanceof SalesforceError) {

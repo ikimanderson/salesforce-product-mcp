@@ -85,17 +85,18 @@ export async function getBulkJobStatus(jobId: string): Promise<BulkJobStatus> {
 }
 
 /**
- * Upload one CSV batch of row data to an open job. Salesforce accepts
- * multiple sequential calls to this endpoint before the job is closed --
- * only the FIRST call's payload may include the CSV header row; every
- * subsequent chunk must be pure data rows, and splits must land on row
- * (newline) boundaries. This function just relays bytes; it can't validate
- * that contract -- the caller (the upload route) is responsible for it.
+ * Upload the full CSV (header + all data rows) to an open job.
+ *
+ * Verified against a real org: Salesforce accepts exactly ONE call to this
+ * endpoint per job -- a second call on the same job is rejected outright
+ * ("Found multiple contents for job"). There is no multi-batch append; the
+ * whole file must go in this one call, capped in practice by Vercel's
+ * request-body limit (~4.5 MB) rather than anything Salesforce-side.
  */
-export async function uploadBulkJobBatch(jobId: string, csvChunk: string): Promise<void> {
+export async function uploadBulkJobBatch(jobId: string, csv: string): Promise<void> {
   await sfFetch(
     `/services/data/${SF_API_VERSION}/jobs/ingest/${encodeURIComponent(jobId)}/batches`,
-    { method: "PUT", headers: { "Content-Type": "text/csv" }, body: csvChunk },
+    { method: "PUT", headers: { "Content-Type": "text/csv" }, body: csv },
   );
 }
 

@@ -188,7 +188,9 @@ const handler = createMcpHandler(
     // way to learn this deployment's own base URL from inside an MCP tool
     // handler), meant to be PUT to via curl from a shell-capable session, not
     // embedded in another tool call. See app/api/bulk/[jobId]/data/route.ts
-    // for the upload contract (including chunking for larger files).
+    // for the upload contract -- ONE PUT per job with the entire CSV; verified
+    // against a real org that Salesforce rejects a second PUT to the same job,
+    // so there is no chunking/multi-batch option here.
     server.tool(
       "start_bulk_product2_job",
       "Open a Salesforce Bulk API 2.0 job to insert, update, or upsert many " +
@@ -267,14 +269,14 @@ const handler = createMcpHandler(
             state: job.state,
             uploadPath: `/api/bulk/${job.id}/data`,
             note:
-              "PUT your CSV to this path on the SAME HOST you called this MCP endpoint on, via curl " +
-              "(e.g. curl --data-binary @file.csv -H \"Authorization: Bearer <MCP_BEARER_TOKEN>\" -X PUT " +
-              "\"<host>/api/bulk/" +
+              "PUT your ENTIRE CSV (header + all rows) in ONE request to this path on the SAME HOST " +
+              "you called this MCP endpoint on, via curl (e.g. curl --data-binary @file.csv -H " +
+              "\"Authorization: Bearer <MCP_BEARER_TOKEN>\" -X PUT \"<host>/api/bulk/" +
               job.id +
-              "/data\"), not through another tool call. If the file might exceed a few MB, split it into " +
-              "row-aligned chunks: PUT each non-final chunk with ?final=false, and only the LAST chunk " +
-              "with ?final=true (or omit the param on a single-shot upload). Only the FIRST chunk may " +
-              "include the CSV header row. After uploading, poll get_bulk_product2_job_status.",
+              "/data\"), not through another tool call. Salesforce accepts exactly one PUT per job -- " +
+              "there is no way to upload in multiple chunks, so the whole file must fit in one request " +
+              "(in practice, comfortably under Vercel's ~4.5 MB request-body limit). After uploading, " +
+              "poll get_bulk_product2_job_status.",
           });
         } catch (err) {
           return toErrorResult(err);

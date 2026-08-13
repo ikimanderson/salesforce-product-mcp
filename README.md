@@ -90,7 +90,8 @@ context. Instead:
    `uploadPath` (e.g. `/api/bulk/{jobId}/data`).
 3. **From a shell-capable session** (Claude Code or similar — not the
    Desktop/claude.ai chat connector, which has no way to stream a local file
-   outside the tool-call schema), stream the actual CSV file to that path:
+   outside the tool-call schema), stream the **entire** CSV file to that path
+   in **one request**:
    ```bash
    curl --data-binary @file.csv \
      -H "Authorization: Bearer <MCP_BEARER_TOKEN>" \
@@ -104,14 +105,20 @@ context. Instead:
    includes a **capped** summary (default: first 25 failures + a total
    count) — never a full multi-thousand-row result dump.
 
-**Chunking for larger files:** Vercel's Node.js serverless functions have a
-hard ~4.5 MB request-body ceiling (not tunable via Next.js config — that only
-applies to the legacy Pages API). If a file might exceed a few MB, split it
-into row-aligned chunks and `PUT` each non-final chunk with `?final=false`,
-then the last chunk with `?final=true` (or omit the param for a single-shot
-upload). **Only the first chunk may include the CSV header row** — the server
-just relays bytes to Salesforce's batches endpoint, it can't fix a mid-row
-split or a repeated header.
+**No chunking — one PUT per job, verified against a real org.** An earlier
+version of this doc (and the route) assumed Salesforce's Bulk API 2.0 would
+accept multiple sequential `PUT` calls to build up a job's data before
+closing it. Live testing proved that wrong: a second `PUT .../batches` call
+on the same job is rejected outright ("Found multiple contents for job").
+**The entire CSV must go in a single request.** The real, unavoidable
+ceiling is Vercel's Node.js serverless request-body limit (~4.5 MB, not
+tunable from Next.js config — that only applies to the legacy Pages API), so
+a file needs to fit under roughly 4.4 MB to be safe. For context: a typical
+Product2 row (a handful of fields) is well under 1 KB, so even a 6,500-row
+file is normally a few hundred KB — comfortably under that ceiling. A file
+that genuinely exceeds it would need to be split across **multiple separate
+Bulk API jobs** (each with its own single PUT) — not built here, since it
+wasn't needed for what this server was built for.
 
 **Row cap:** `start_bulk_product2_job` rejects a declared `rowCount` above
 `MAX_ROW_COUNT` (50,000, in `lib/bulkProduct2.ts`). This is a self-imposed
@@ -270,7 +277,7 @@ app/
     [transport]/route.ts    # MCP handler: create_product2, update_product2,
                              #   start_bulk_product2_job, get_bulk_product2_job_status
     bulk/[jobId]/data/route.ts  # plain HTTP PUT endpoint for streaming CSV bytes
-                                 #   (not an MCP tool) -- chunked upload contract
+                                 #   (not an MCP tool) -- one PUT per job, no chunking
 lib/
   auth.ts                    # shared bearer-token check, used by both routes above
   salesforce.ts              # Client Credentials auth, token cache, REST helper (sfFetch)
