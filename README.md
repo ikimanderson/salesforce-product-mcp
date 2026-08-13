@@ -8,7 +8,7 @@ sibling to a separate read-only server (`soql_query`, `account_intel`), kept
 apart so the token that can mutate CRM data is distinct from — and smaller in
 blast radius than — the one that only reads it.
 
-- **Endpoint:** `https://<project>.vercel.app/api/mcp` (Streamable HTTP)
+- **Endpoint:** `https://salesforce-product-mcp.vercel.app/api/mcp` (Streamable HTTP)
 - **Tools:** `create_product2`, `update_product2`
 - **Transport:** Streamable HTTP only (no SSE, no Redis)
 - **Runtime:** Node.js (not Edge)
@@ -99,8 +99,8 @@ With the server running (`npm run dev` or `npm run start`):
 
 ```bash
 MCP_BEARER_TOKEN=<your-token> npm run check-auth
-# or against a deployment:
-MCP_BEARER_TOKEN=<your-token> node scripts/check-auth.mjs https://<project>.vercel.app
+# or against the live deployment:
+MCP_BEARER_TOKEN=<your-token> node scripts/check-auth.mjs https://salesforce-product-mcp.vercel.app
 ```
 
 Expected: the request **without** a token returns `401`; the request **with**
@@ -141,10 +141,39 @@ vercel --prod                        # promote to production
 
 ## Connecting from Claude
 
-Add a custom connector pointing at the production `/api/mcp` URL, with the
-bearer token as the authorization credential. (Exact steps depend on the
-Claude client.) Use a bearer token distinct from the read-only sibling
+Settings → Connectors → **Add custom connector**. Name it something that
+signals its blast radius — e.g. "Salesforce Product Write (USE CAUTION!)" —
+since it's easy to lose track of which connector can write CRM data once
+you have several. Use a bearer token distinct from the read-only sibling
 server's, so the two can be rotated/revoked independently.
+
+The dialog's auth options vary by rollout:
+
+- **If there's a "Request headers" field** (beta, gradually rolled out):
+  set header `Authorization` to `Bearer <MCP_BEARER_TOKEN>` (space after
+  `Bearer`), and use the plain endpoint URL.
+- **If the dialog only shows OAuth Client ID/Secret** (no headers field —
+  the common case as of this writing): leave those blank and instead bake
+  the token into the URL itself, using the server's built-in `?token=`
+  fallback:
+  ```
+  https://salesforce-product-mcp.vercel.app/api/mcp?token=<MCP_BEARER_TOKEN>
+  ```
+  This isn't a workaround bolted onto the docs — `extractToken()` in
+  `route.ts` accepts the token via either the `Authorization` header or a
+  `?token=`/`?key=` query param specifically because claude.ai's connector
+  dialog has historically had no bearer-token field for servers without an
+  OAuth authorization server.
+
+Under **Connection methods**, leave **Individual sign-in** on and skip
+**Managed authorization**. Managed authorization connects your whole
+workspace through your identity provider with no per-member opt-in — the
+opposite of what you want for a connector that can write to Product2. It
+also targets OAuth/SSO connectors; this server doesn't do OAuth, so it
+isn't a fit here regardless.
+
+Once connected, run a dry-run call first (omit `confirm`) to confirm the
+round trip works before doing a real write.
 
 ## Operational notes
 
